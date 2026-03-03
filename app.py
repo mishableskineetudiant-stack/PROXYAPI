@@ -346,7 +346,7 @@ async def test_one(
         start = time.monotonic()
         try:
             async with session.get(
-                "http://httpbin.org/ip",
+                "https://httpbin.org/ip",
                 proxy=f"{protocol}://{ip}:{port}",
                 timeout=aiohttp.ClientTimeout(total=TEST_TIMEOUT_S),
                 ssl=False,
