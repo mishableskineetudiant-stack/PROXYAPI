@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
 PROXY API — Render Free Tier
-Pool 100% propre :
-- Proxy doit répondre 200
-- Proxy doit cacher notre vraie IP (pas transparent)
-- Retesté toutes les 45s, mort = viré immédiatement
+Pool 100% propre, alimenté en continu
 """
 
 import asyncio
@@ -30,13 +27,13 @@ import os
 DB_PATH              = "/tmp/proxies.db"
 API_HOST             = "0.0.0.0"
 API_PORT             = int(os.environ.get("PORT", 8888))
+SELF_URL             = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-SCRAPE_INTERVAL_S    = 300
-RETEST_INTERVAL_S    = 45
-MAX_CONCURRENT_TESTS = 50
-TEST_TIMEOUT_S       = 6
+SCRAPE_PAUSE_S       = 60    # pause entre 2 cycles de scrape
+RETEST_INTERVAL_S    = 45    # retest le pool toutes les 45s
+MAX_CONCURRENT_TESTS = 50    # connexions simultanées
+TEST_TIMEOUT_S       = 6     # timeout par proxy
 
-# Notre vraie IP — récupérée au démarrage
 MY_IP: Optional[str] = None
 
 SCRAPE_SOURCES = [
@@ -144,8 +141,8 @@ async def db_pop_candidates(limit: int) -> List[Tuple[str, int, str]]:
 
 async def db_set_results(results: list):
     """
-    Vivant + pas transparent = on garde.
-    Tout le reste = on vire.
+    Vivant + anonymous ou elite → on garde.
+    Tout le reste → viré.
     """
     if not results:
         return
@@ -172,7 +169,6 @@ async def db_set_results(results: list):
                     r["last_success"],
                 ))
             else:
-                # Transparent, mort, unknown → poubelle
                 await db.execute(
                     "DELETE FROM proxies WHERE ip=? AND port=? AND protocol=?",
                     (r["ip"], r["port"], r["protocol"]),
@@ -305,7 +301,6 @@ async def scrape_all() -> int:
 # ══════════════════════════════════════════════════════════════
 
 async def fetch_my_ip() -> Optional[str]:
-    """Récupère notre vraie IP au démarrage."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -314,10 +309,10 @@ async def fetch_my_ip() -> Optional[str]:
             ) as resp:
                 data = await resp.json()
                 ip = data.get("ip")
-                print(f"[INIT] Notre IP publique: {ip}")
+                print(f"[INIT] Notre IP: {ip}")
                 return ip
     except Exception as e:
-        print(f"[INIT] Impossible de récupérer notre IP: {e}")
+        print(f"[INIT] Erreur IP: {e}")
         return None
 
 
@@ -326,13 +321,6 @@ async def test_one(
     ip: str, port: int, protocol: str,
     sem: asyncio.Semaphore,
 ) -> dict:
-    """
-    Teste un proxy.
-    Règles strictes :
-      - Doit répondre 200
-      - Doit masquer notre vraie IP (pas transparent, pas unknown)
-      - Doit retourner un JSON valide avec 'origin'
-    """
     result = {
         "ip": ip, "port": port, "protocol": protocol,
         "last_checked": datetime.utcnow().isoformat(),
@@ -345,42 +333,38 @@ async def test_one(
     async with sem:
         start = time.monotonic()
         try:
+            # SOCKS → test HTTP / HTTP → test HTTPS (tunnel CONNECT)
+            if protocol in ("socks4", "socks5"):
+                test_url = "http://httpbin.org/ip"
+            else:
+                test_url = "https://httpbin.org/ip"
+
             async with session.get(
-                "https://httpbin.org/ip",
+                test_url,
                 proxy=f"{protocol}://{ip}:{port}",
                 timeout=aiohttp.ClientTimeout(total=TEST_TIMEOUT_S),
                 ssl=False,
             ) as resp:
                 if resp.status != 200:
-                    return result  # mort
+                    return result
 
                 elapsed = int((time.monotonic() - start) * 1000)
                 body = await resp.text()
 
-                # Doit être un JSON valide
                 try:
                     data = json.loads(body)
                 except Exception:
-                    return result  # réponse invalide → poubelle
+                    return result
 
                 origin = data.get("origin", "")
-
-                # Doit avoir un champ origin
                 if not origin:
                     return result
 
-                # Notre vraie IP ne doit PAS apparaître
+                # Notre IP visible → transparent → poubelle
                 if MY_IP and MY_IP in origin:
-                    result["anonymity"] = "transparent"
-                    result["is_alive"] = False  # transparent = poubelle
                     return result
 
-                # Plusieurs IPs dans origin = anonymous
-                # Une seule IP différente de la nôtre = elite
-                if "," in origin:
-                    anonymity = "anonymous"
-                else:
-                    anonymity = "elite"
+                anonymity = "anonymous" if "," in origin else "elite"
 
                 result["is_alive"] = True
                 result["response_time_ms"] = elapsed
@@ -388,7 +372,7 @@ async def test_one(
                 result["anonymity"] = anonymity
 
         except Exception:
-            pass  # timeout, refused, etc. → mort
+            pass
 
     return result
 
@@ -444,43 +428,63 @@ async def run_tests(
 # BACKGROUND LOOPS
 # ══════════════════════════════════════════════════════════════
 
-_scrape_lock = asyncio.Lock()
-_retest_lock = asyncio.Lock()
-
-
 async def loop_scrape():
-    """Scrape + teste les nouveaux candidats en boucle."""
+    """
+    Scrape toutes les sources → teste tous les candidats
+    → repart immédiatement avec 60s de pause entre cycles.
+    Ne s'arrête jamais.
+    """
     await asyncio.sleep(2)
     while True:
-        if not _scrape_lock.locked():
-            async with _scrape_lock:
-                try:
-                    await scrape_all()
-                    while True:
-                        batch = await db_pop_candidates(200)
-                        if not batch:
-                            break
-                        await run_tests(batch, label="NEW")
-                except Exception as e:
-                    print(f"[SCRAPE LOOP] Error: {e}")
-        await asyncio.sleep(SCRAPE_INTERVAL_S)
+        try:
+            await scrape_all()
+            # Vide toute la file de candidats
+            while True:
+                batch = await db_pop_candidates(200)
+                if not batch:
+                    break
+                await run_tests(batch, label="NEW")
+        except Exception as e:
+            print(f"[SCRAPE LOOP] Error: {e}")
+        print("[SCRAPE LOOP] Cycle fini — reprise dans 60s")
+        await asyncio.sleep(SCRAPE_PAUSE_S)
 
 
 async def loop_retest():
-    """Retest le pool actif toutes les 45s."""
+    """
+    Retest le pool vivant toutes les 45s.
+    Mort → viré immédiatement.
+    """
     await asyncio.sleep(15)
     while True:
-        if not _retest_lock.locked():
-            async with _retest_lock:
-                try:
-                    pool = await db_get_alive_pool()
-                    if pool:
-                        await run_tests(pool, label="RETEST")
-                    else:
-                        print("[RETEST] Pool vide...")
-                except Exception as e:
-                    print(f"[RETEST LOOP] Error: {e}")
+        try:
+            pool = await db_get_alive_pool()
+            if pool:
+                await run_tests(pool, label="RETEST")
+            else:
+                print("[RETEST] Pool vide...")
+        except Exception as e:
+            print(f"[RETEST LOOP] Error: {e}")
         await asyncio.sleep(RETEST_INTERVAL_S)
+
+
+async def loop_keepalive():
+    """
+    Se ping lui-même toutes les 10min pour pas s'endormir sur Render free tier.
+    """
+    await asyncio.sleep(30)
+    while True:
+        if SELF_URL:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    await s.get(
+                        f"{SELF_URL}/health",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    )
+                    print("[KEEPALIVE] Ping OK")
+            except Exception as e:
+                print(f"[KEEPALIVE] Erreur: {e}")
+        await asyncio.sleep(600)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -490,29 +494,30 @@ async def loop_retest():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global MY_IP
-    print("\n=== PROXY API v4 — Starting ===")
+    print("\n=== PROXY API v5 — Starting ===")
     init_db()
     MY_IP = await fetch_my_ip()
     asyncio.create_task(loop_scrape())
     asyncio.create_task(loop_retest())
-    print("[APP] Ready\n")
+    asyncio.create_task(loop_keepalive())
+    print("[APP] Ready — 3 loops lancées\n")
     yield
     print("[APP] Shutting down")
 
 
-app = FastAPI(title="Proxy API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Proxy API", version="5.0.0", lifespan=lifespan)
 
 
 @app.get("/")
 async def root():
     s = await db_stats()
     return {
-        "alive":             s.get("alive", 0),
-        "elite":             s.get("elite", 0),
-        "anonymous":         s.get("anonymous", 0),
-        "candidates_pending":s.get("candidates_pending", 0),
-        "by_protocol":       s.get("by_protocol", []),
-        "note":              "Pool 100% propre — transparent et unknown exclus",
+        "alive":              s.get("alive", 0),
+        "elite":              s.get("elite", 0),
+        "anonymous":          s.get("anonymous", 0),
+        "candidates_pending": s.get("candidates_pending", 0),
+        "by_protocol":        s.get("by_protocol", []),
+        "note":               "Pool 100% propre — transparent et unknown exclus",
     }
 
 
@@ -568,12 +573,12 @@ async def random_proxy(
         raise HTTPException(404, "Aucun proxy disponible")
     p = proxies[0]
     return {
-        "proxy":            f"{p['protocol']}://{p['ip']}:{p['port']}",
-        "ip":               p["ip"],
-        "port":             p["port"],
-        "protocol":         p["protocol"],
-        "anonymity":        p["anonymity"],
-        "response_time_ms": p["response_time_ms"],
+        "proxy":             f"{p['protocol']}://{p['ip']}:{p['port']}",
+        "ip":                p["ip"],
+        "port":              p["port"],
+        "protocol":          p["protocol"],
+        "anonymity":         p["anonymity"],
+        "response_time_ms":  p["response_time_ms"],
     }
 
 
@@ -587,6 +592,10 @@ async def health():
     s = await db_stats()
     return {"status": "ok", "alive": s.get("alive", 0)}
 
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="info")
